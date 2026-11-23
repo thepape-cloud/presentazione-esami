@@ -1,0 +1,292 @@
+<!doctype html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Naval Battle</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas {
+    width: min(100vw, calc(100vh * 4 / 3));
+    height: auto; aspect-ratio: 4 / 3;
+    image-rendering: pixelated; touch-action: none; cursor: crosshair;
+    background: #0000aa; outline: none;
+  }
+</style>
+</head>
+<body>
+<canvas id="c" width="640" height="480" tabindex="0"></canvas>
+<script>
+"use strict";
+/* Porting in JavaScript/canvas di "Naval Battle" (Borland C++ / BGI, 640x480, palette EGA/VGA).
+   Regole originali: griglia 8x8, 8 navi nascoste, 60 colpi, mirino con le frecce, INVIO per sparare. */
+
+const cv = document.getElementById("c");
+const ctx = cv.getContext("2d");
+const W = 640, H = 480;
+
+// Palette EGA (indici BGI)
+const PAL = ["#000000","#0000aa","#00aa00","#00aaaa","#aa0000","#aa00aa","#aa5500","#aaaaaa",
+             "#555555","#5555ff","#55ff55","#55ffff","#ff5555","#ff55ff","#ffff55","#ffffff"];
+const BLACK = 0, BLUE = 1, GREEN = 2, CYAN = 3, RED = 4, LGREEN = 10, LRED = 12, YELLOW = 14, WHITE = 15;
+
+const GRID = 8, CELL = 40, MAX_SHOTS = 60, SHIPS = 8;
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+// ---------- primitive in stile BGI ----------
+let bg = BLUE;
+function clear(color = bg) { ctx.fillStyle = PAL[color]; ctx.fillRect(0, 0, W, H); }
+function circle(x, y, r, col) {
+  ctx.strokeStyle = PAL[col]; ctx.lineWidth = 1.5;
+  ctx.beginPath(); ctx.arc(x, y, Math.max(r, 0.5), 0, Math.PI * 2); ctx.stroke();
+}
+function line(x1, y1, x2, y2, col, w = 1.5) {
+  ctx.strokeStyle = PAL[col]; ctx.lineWidth = w;
+  ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
+}
+function rect(x1, y1, x2, y2, col) {
+  ctx.strokeStyle = PAL[col]; ctx.lineWidth = 1.5;
+  ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+}
+function arc(x, y, a0, a1, r, col) { // gradi, antiorario come BGI
+  ctx.strokeStyle = PAL[col]; ctx.lineWidth = 1.5;
+  ctx.beginPath(); ctx.arc(x, y, r, -a0 * Math.PI / 180, -a1 * Math.PI / 180, true); ctx.stroke();
+}
+function text(x, y, s, col) {
+  ctx.fillStyle = PAL[col]; ctx.font = "bold 12px 'Courier New', monospace"; ctx.textBaseline = "top";
+  ctx.fillText(s, x, y);
+}
+
+// ---------- audio ----------
+let actx = null;
+function audio() { if (!actx) { try { actx = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {} } return actx; }
+function beep(freq, dur, type = "square", vol = 0.05) {
+  const a = audio(); if (!a) return;
+  const o = a.createOscillator(), g = a.createGain();
+  o.type = type; o.frequency.value = freq; g.gain.value = vol;
+  g.gain.exponentialRampToValueAtTime(0.0001, a.currentTime + dur);
+  o.connect(g); g.connect(a.destination); o.start(); o.stop(a.currentTime + dur);
+}
+function boom() {
+  const a = audio(); if (!a) return;
+  const n = a.sampleRate * 0.5, buf = a.createBuffer(1, n, a.sampleRate), d = buf.getChannelData(0);
+  for (let i = 0; i < n; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / n, 2);
+  const s = a.createBufferSource(), g = a.createGain(); g.gain.value = 0.25;
+  s.buffer = buf; s.connect(g); g.connect(a.destination); s.start();
+}
+
+// ---------- stato di gioco ----------
+let state = "intro";           // intro | play | busy | end
+let skip = false;              // salta l'animazione corrente
+let ships, shots, hits;        // ships: Set "c,r"; shots: Map "c,r" -> "hit"|"miss"
+let cx = 1, cy = 1;            // mirino (1..8)
+let msg = "";
+let fx = null;                 // effetto temporaneo disegnato sopra la scena
+
+function newGame() {
+  ships = new Set();
+  while (ships.size < SHIPS) ships.add((1 + Math.floor(Math.random() * GRID)) + "," + (1 + Math.floor(Math.random() * GRID)));
+  shots = new Map(); hits = 0; cx = 1; cy = 1; msg = ""; fx = null;
+}
+
+// ---------- disegno della scena di gioco ----------
+function drawShip(px, py) { // px,py = centro cella (stesse coordinate del disegno originale)
+  const o = (x, y) => [x + px - 40, y + py - 40];
+  const L = (a, b, c, d) => { const [x1, y1] = o(a, b), [x2, y2] = o(c, d); line(x1, y1, x2, y2, WHITE); };
+  L(34, 34, 41, 22); L(34, 34, 38, 43); L(41, 22, 52, 43); L(46, 30, 50, 26); L(49, 36, 54, 31); L(50, 26, 54, 31);
+}
+function drawWaves(px, py) {
+  arc(px - 12, py + 9, 0, 180, 6, CYAN); arc(px, py + 9, 0, 180, 6, CYAN); arc(px + 12, py + 9, 0, 180, 6, CYAN);
+}
+function drawCross(px, py, col, inner = true) {
+  if (inner) circle(px, py, 5, col);
+  circle(px, py, 15, col);
+  line(px - 19, py, px + 19, py, col); line(px, py - 19, px, py + 19, col);
+}
+function scene() {
+  clear(BLUE);
+  // griglia
+  rect(20, 20, 340, 340, YELLOW);
+  for (let i = 1; i < GRID; i++) { line(20 + 40 * i, 20, 20 + 40 * i, 340, YELLOW); line(20, 20 + 40 * i, 340, 20 + 40 * i, YELLOW); }
+  // risultati dei colpi
+  for (const [k, v] of shots) {
+    const [c, r] = k.split(",").map(Number);
+    if (v === "hit") drawShip(40 * c, 40 * r); else drawWaves(40 * c, 40 * r);
+  }
+  // coordinate
+  text(0, 0, "     1    2    3    4    5    6    7    8", LGREEN);
+  "ABCDEFGH".split("").forEach((ch, i) => text(5, 40 + 40 * i - 4, ch, LGREEN));
+  // titolo e istruzioni
+  text(400, 40, "N A V A L", LRED); text(400, 55, " B A T T L E", CYAN);
+  text(352, 80, "MUOVI IL MIRINO CON LE FRECCETTE", WHITE);
+  text(352, 95, "E PREMI INVIO PER FARE FUOCO, MA", WHITE);
+  text(352, 110, "ATTENTO AI COLPI LIMITATI (60)!!!", WHITE);
+  text(345, 37, "ESCI", RED);
+  // finestra SMS
+  rect(20, 384, 340, 475, GREEN); text(30, 388, "SMS DAL CAPITANO DI PRUA", GREEN);
+  text(30, 420, msg, LRED);
+  text(400, 410, "        B U O N", LGREEN); text(400, 430, " D I V E R T I M E N T O", LRED);
+  text(20, 350, "COLPI RIMASTI", LGREEN);
+  const left = MAX_SHOTS - shots.size - extraShots;
+  for (let i = 0; i < Math.max(left, 0); i++) circle(20 + i * 9, 373, 3, RED);
+  text(400, 200, "NAVI COLPITE: " + hits + "/" + SHIPS, YELLOW);
+  // mirino: solo quello rosso
+  if (state === "play" || state === "busy") drawCross(40 * cx, 40 * cy, RED);
+  if (fx) fx();
+}
+let extraShots = 0; // colpi sprecati (ripetuti o fuori griglia), scalano comunque il contatore come nell'originale
+function present() { scene(); }
+
+// ---------- animazioni ----------
+async function frames(n, ms, fn) {
+  for (let i = 0; i < n && !skip; i++) { fn(i); await sleep(ms); }
+}
+async function esplosione(px, py) {
+  boom();
+  await frames(20, 20, i => {
+    scene();
+    for (let k = 0; k <= i; k++) circle(px, py, k, k < 4 ? WHITE : k < 14 ? YELLOW : RED);
+  });
+  fx = null;
+}
+
+// intro: nave, mirino, esplosione, sfarfallio, bandiere
+async function presentazione() {
+  skip = false; bg = BLUE;
+  const hull = mov => {
+    const m = mov;
+    line(80 + m, 250, 240 + m, 250, WHITE); line(80 + m, 250, 40 + m, 170, WHITE);
+    line(40 + m, 170, 280 + m, 170, WHITE); line(240 + m, 250, 280 + m, 170, WHITE);
+    line(100 + m, 170, 100 + m, 90, WHITE); line(100 + m, 90, 140 + m, 90, WHITE);
+    line(140 + m, 90, 140 + m, 170, WHITE); line(100 + m, 100, 140 + m, 100, WHITE);
+    line(145 + m, 170, 145 + m, 110, WHITE); line(145 + m, 110, 185 + m, 110, WHITE);
+    line(185 + m, 110, 185 + m, 170, WHITE); line(145 + m, 120, 185 + m, 120, WHITE);
+    for (let l = 0; l < 9; l++) { line(101 + m, 91 + l, 139 + m, 91 + l, RED); line(146 + m, 111 + l, 184 + m, 111 + l, RED); }
+    for (let o = 0; o < 7; o++) { circle(85 + o * 23 + m, 210, 5, WHITE); circle(85 + o * 23 + m, 210, 7, WHITE); }
+  };
+  for (let mov = 0; mov < 145 && !skip; mov += 5) { clear(BLUE); hull(mov); await sleep(40); }
+  if (!skip) {
+    const target = () => { circle(310, 239, 25, RED); circle(310, 239, 10, RED); line(310, 202, 310, 276, RED); line(270, 239, 350, 239, RED); };
+    for (let c = 0; c < 30 && !skip; c++) {
+      clear(BLUE); hull(140); target();
+      line(310, 202, 310, 212 + c, WHITE); line(270, 239, 280 + c, 239, WHITE);
+      line(310, 276, 310, 266 - c, WHITE); line(350, 239, 340 - c, 239, WHITE);
+      beep(200 + c * 20, 0.03); await sleep(40);
+    }
+  }
+  if (!skip) {
+    boom();
+    await frames(150, 10, r => { clear(BLUE); hull(140); circle(310, 239, r, r < 40 ? WHITE : r < 100 ? YELLOW : RED); for (let k = 0; k < r; k += 6) circle(310, 239, k, k < 40 ? WHITE : k < 100 ? YELLOW : RED); });
+  }
+  await frames(45, 25, i => { ctx.fillStyle = PAL[i % 15]; ctx.fillRect(0, 0, W, H); });
+  // bandiere che si chiudono
+  if (!skip) {
+    // tricolore: verde a sinistra, bianco al centro, rosso a destra
+    clear(WHITE);
+    for (let a = 0; a < 214 && !skip; a += 2) { line(a, 0, a, 480, GREEN, 3); if (a % 20 === 0) await sleep(8); }
+    for (let a = 0; a < 214 && !skip; a += 2) { line(640 - a, 0, 640 - a, 480, RED, 3); if (a % 20 === 0) await sleep(8); }
+    if (!skip) { ctx.fillStyle = PAL[GREEN]; ctx.fillRect(0, 0, 214, 480); ctx.fillStyle = PAL[RED]; ctx.fillRect(426, 0, 214, 480); }
+    text(258, 238, "NAVAL BATTLE", RED); text(247, 252, "UNITI PER LA PATRIA", RED);
+    await sleep(1800);
+  }
+  skip = false;
+}
+
+async function vittoria() {
+  clear(BLACK);
+  let ragg = 0, raggi = 0, rag = 30;
+  await frames(150, 20, () => {
+    clear(BLACK); circle(320, 240, ragg, RED);
+    if (ragg > 100) { circle(320, 240, raggi, RED); raggi++; }
+    ragg++;
+    line(320, 240, 320 + rag, 240, RED); line(320, 240, 320 - rag, 240, RED);
+    line(320, 240, 320, 240 + rag, RED); line(320, 240, 320, 240 - rag, RED); rag++;
+  });
+  await frames(180, 8, c => {
+    line(140, 240, 140 + c, 240, WHITE); line(500, 240, 500 - c, 240, WHITE);
+    line(320, 60, 320, 60 + c, WHITE); line(320, 420, 320, 420 - c, WHITE);
+  });
+  await frames(45, 25, i => { ctx.fillStyle = PAL[i % 15]; ctx.fillRect(0, 0, W, H); });
+}
+async function scrittaCasuale(s) {
+  clear(BLACK);
+  await frames(500, 6, () => {
+    text(1 + Math.random() * 540, 1 + Math.random() * 450, s, 1 + Math.floor(Math.random() * 15));
+  });
+}
+
+// ---------- logica ----------
+async function fire() {
+  if (state !== "play") return;
+  const k = cx + "," + cy;
+  if (shots.has(k)) {
+    extraShots++; msg = "Ma che sei sordo hai gia sparato li!!!"; beep(150, 0.2, "sawtooth"); present();
+  } else if (ships.has(k)) {
+    state = "busy"; msg = "Ahhh!!! Colpito al cuore!!!";
+    shots.set(k, "hit"); hits++;
+    await esplosione(40 * cx, 40 * cy);
+    state = "play"; present();
+  } else {
+    shots.set(k, "miss"); msg = "Fallito!!! Ma no picarte adesso!!!"; beep(300, 0.15); present();
+  }
+  if (hits === SHIPS || shots.size + extraShots >= MAX_SHOTS) await fine(hits === SHIPS);
+}
+async function fine(win) {
+  state = "busy"; skip = false;
+  await vittoria();
+  await scrittaCasuale(win ? "YOU WIN" : "GAME OVER");
+  clear(BLACK);
+  const t = win ? "YOU WIN" : "GAME OVER";
+  ctx.font = "bold 40px 'Courier New', monospace"; ctx.textAlign = "center"; ctx.fillStyle = PAL[win ? LGREEN : LRED];
+  ctx.fillText(t, 320, 180);
+  ctx.font = "bold 14px 'Courier New', monospace"; ctx.fillStyle = PAL[WHITE];
+  ctx.fillText("Navi colpite: " + hits + "/" + SHIPS, 320, 250);
+  ctx.fillText("Premi INVIO o tocca per rigiocare", 320, 290);
+  ctx.textAlign = "left";
+  state = "end";
+}
+async function start(withIntro) {
+  state = "intro";
+  if (withIntro) await presentazione();
+  newGame(); extraShots = 0; bg = BLUE; state = "play"; present();
+}
+function move(dx, dy) {
+  if (state !== "play") return;
+  cx = Math.min(GRID, Math.max(1, cx + dx)); cy = Math.min(GRID, Math.max(1, cy + dy)); present();
+}
+
+// ---------- input ----------
+addEventListener("keydown", e => {
+  audio();
+  if (state === "intro") { skip = true; e.preventDefault(); return; }
+  if (state === "busy") { skip = true; e.preventDefault(); return; }
+  if (state === "end") { if (e.key === "Enter" || e.key === " ") start(false); return; }
+  const k = e.key;
+  if (k === "ArrowUp") move(0, -1); else if (k === "ArrowDown") move(0, 1);
+  else if (k === "ArrowLeft") move(-1, 0); else if (k === "ArrowRight") move(1, 0);
+  else if (k === "Enter" || k === " ") fire();
+  else if (k === "Escape") start(true);
+  else return;
+  e.preventDefault();
+});
+function toCanvas(e) {
+  const r = cv.getBoundingClientRect();
+  return [(e.clientX - r.left) * W / r.width, (e.clientY - r.top) * H / r.height];
+}
+cv.addEventListener("pointerdown", e => {
+  audio(); cv.focus();
+  if (state === "intro" || state === "busy") { skip = true; return; }
+  if (state === "end") { start(false); return; }
+  const [x, y] = toCanvas(e);
+  if (x > 340 && x < 395 && y > 30 && y < 55) { start(true); return; } // ESCI
+  if (x >= 20 && x < 340 && y >= 20 && y < 340) {
+    const c = Math.floor((x - 20) / CELL) + 1, r = Math.floor((y - 20) / CELL) + 1;
+    if (c === cx && r === cy) fire(); else { cx = c; cy = r; present(); }
+  }
+});
+
+start(true);
+</script>
+</body>
+</html>

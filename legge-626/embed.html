@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Legge 626 · programma Flash</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #fff; overflow: hidden; }
+  #stage, #stage ruffle-player { width: 100%; height: 100%; display: block; }
+</style>
+</head>
+<body>
+<div id="stage"></div>
+<script>window.RufflePlayer = { config: { autoplay: "auto", unmuteOverlay: "visible", letterbox: "on", warnOnUnsupportedContent: false } };</script>
+<script src="ruffle/ruffle.js"></script>
+<script>
+  addEventListener("load", () => {
+    const player = window.RufflePlayer.newest().createPlayer();
+    document.getElementById("stage").appendChild(player);
+    player.load("flash/626.swf");
+  });
+</script>
+</body>
+</html>
